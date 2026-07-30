@@ -316,7 +316,7 @@ Verify an image:
 
 ```console
 gh attestation verify \
-  oci://ghcr.io/maiko/zabbix-discord-ops:VERSION \
+  oci://ghcr.io/maiko/zabbix-discord-ops-container:VERSION \
   --repo maiko/zabbix-discord-ops
 ```
 
