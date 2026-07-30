@@ -41,6 +41,7 @@ type discordClient interface {
 	CreateMessage(context.Context, string, any) (discord.Message, error)
 	EditMessage(context.Context, string, string, any) error
 	EditOriginalInteraction(context.Context, string, string, any) error
+	DeleteOriginalInteraction(context.Context, string, string) error
 	FindMessageByNonce(
 		context.Context,
 		string,
@@ -66,19 +67,20 @@ type metrics struct {
 }
 
 type App struct {
-	cfg              config.Config
-	ingestToken      string
-	verifier         *discord.Verifier
-	signer           *discord.Signer
-	discord          discordClient
-	zabbix           zabbixClient
-	logger           *slog.Logger
-	now              func() time.Time
-	correlations     *correlation.Store
-	correlationLocks *keyedLocker
-	ingestTimeout    time.Duration
-	deferredJobs     sync.WaitGroup
-	metrics          metrics
+	cfg               config.Config
+	ingestToken       string
+	verifier          *discord.Verifier
+	signer            *discord.Signer
+	discord           discordClient
+	zabbix            zabbixClient
+	logger            *slog.Logger
+	now               func() time.Time
+	correlations      *correlation.Store
+	correlationLocks  *keyedLocker
+	ingestTimeout     time.Duration
+	successMessageTTL time.Duration
+	deferredJobs      sync.WaitGroup
+	metrics           metrics
 }
 
 type IngestEvent struct {
@@ -127,12 +129,13 @@ func New(
 			secrets.DiscordBotToken,
 			cfg.DiscordBotUserID,
 		),
-		zabbix:           zabbix.NewClient(cfg.ZabbixURL, secrets.ZabbixAPIToken),
-		logger:           logger,
-		now:              time.Now,
-		correlations:     correlations,
-		correlationLocks: newKeyedLocker(),
-		ingestTimeout:    8 * time.Second,
+		zabbix:            zabbix.NewClient(cfg.ZabbixURL, secrets.ZabbixAPIToken),
+		logger:            logger,
+		now:               time.Now,
+		correlations:      correlations,
+		correlationLocks:  newKeyedLocker(),
+		ingestTimeout:     8 * time.Second,
+		successMessageTTL: 3 * time.Second,
 	}
 	if err := application.inspectCompletedCorrelations(time.Now()); err != nil {
 		return nil, fmt.Errorf("inspect correlation state: %w", err)
@@ -326,16 +329,39 @@ func (a *App) completeDeferredInteraction(interaction discord.Interaction) {
 	}
 	editContext, editCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer editCancel()
-	if editErr := a.discord.EditOriginalInteraction(
+	editErr := a.discord.EditOriginalInteraction(
 		editContext,
 		interaction.ApplicationID,
 		interaction.Token,
 		interactionMessage(content),
-	); editErr != nil {
+	)
+	if editErr != nil {
 		a.metrics.errors.Add(1)
 		a.logger.Error("edit deferred Discord interaction",
 			"interaction_id", interaction.ID,
 			"error", editErr,
+		)
+		return
+	}
+	if err != nil {
+		return
+	}
+
+	timer := time.NewTimer(a.successMessageTTL)
+	defer timer.Stop()
+	<-timer.C
+
+	deleteContext, deleteCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer deleteCancel()
+	if deleteErr := a.discord.DeleteOriginalInteraction(
+		deleteContext,
+		interaction.ApplicationID,
+		interaction.Token,
+	); deleteErr != nil {
+		a.metrics.errors.Add(1)
+		a.logger.Error("delete successful Discord interaction",
+			"interaction_id", interaction.ID,
+			"error", deleteErr,
 		)
 	}
 }

@@ -104,6 +104,32 @@ func TestClientEditsDeferredInteractionWithoutBotAuthorization(t *testing.T) {
 	}
 }
 
+func TestClientDeletesDeferredInteractionWithoutBotAuthorization(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(
+		response http.ResponseWriter,
+		request *http.Request,
+	) {
+		if request.Method != http.MethodDelete ||
+			request.URL.Path != "/webhooks/1006/interaction-token/messages/@original" {
+			t.Fatalf("unexpected interaction delete: %s %s", request.Method, request.URL)
+		}
+		if request.Header.Get("Authorization") != "" {
+			t.Fatal("interaction webhook request included bot authorization")
+		}
+		response.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "test-token", "1006")
+	if err := client.DeleteOriginalInteraction(
+		context.Background(),
+		"1006",
+		"interaction-token",
+	); err != nil {
+		t.Fatalf("delete original interaction: %v", err)
+	}
+}
+
 func TestClientEditsChannelMessageWithBotAuthorization(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(
 		response http.ResponseWriter,

@@ -104,6 +104,22 @@ func (c *Client) EditOriginalInteraction(
 	)
 }
 
+func (c *Client) DeleteOriginalInteraction(
+	ctx context.Context,
+	applicationID, interactionToken string,
+) error {
+	if !isDecimal(applicationID) || interactionToken == "" {
+		return errors.New("invalid Discord application ID or interaction token")
+	}
+	return c.requestWithoutAuthorization(
+		ctx,
+		http.MethodDelete,
+		"/webhooks/"+applicationID+"/"+url.PathEscape(interactionToken)+"/messages/@original",
+		nil,
+		nil,
+	)
+}
+
 func (c *Client) FindMessageByNonce(
 	ctx context.Context,
 	channelID, nonce string,

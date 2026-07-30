@@ -27,19 +27,20 @@ import (
 )
 
 type fakeDiscord struct {
-	createdChannel  string
-	createdPayload  any
-	createCount     int
-	editedChannel   string
-	editedMessage   string
-	foundMessage    discord.Message
-	findMessage     bool
-	findCount       int
-	createStarted   chan struct{}
-	createRelease   chan struct{}
-	createStartOnce sync.Once
-	botUserID       string
-	interactionEdit chan string
+	createdChannel    string
+	createdPayload    any
+	createCount       int
+	editedChannel     string
+	editedMessage     string
+	foundMessage      discord.Message
+	findMessage       bool
+	findCount         int
+	createStarted     chan struct{}
+	createRelease     chan struct{}
+	createStartOnce   sync.Once
+	botUserID         string
+	interactionEdit   chan string
+	interactionDelete chan struct{}
 }
 
 func (f *fakeDiscord) CurrentUser(context.Context) (discord.User, error) {
@@ -102,6 +103,16 @@ func (f *fakeDiscord) EditOriginalInteraction(
 	content, _ := payload.(map[string]any)["content"].(string)
 	if f.interactionEdit != nil {
 		f.interactionEdit <- content
+	}
+	return nil
+}
+
+func (f *fakeDiscord) DeleteOriginalInteraction(
+	_ context.Context,
+	_, _ string,
+) error {
+	if f.interactionDelete != nil {
+		f.interactionDelete <- struct{}{}
 	}
 	return nil
 }
@@ -188,7 +199,11 @@ func testApp(t *testing.T) (*App, ed25519.PrivateKey, *fakeDiscord, *fakeZabbix)
 	}
 	now := time.Unix(1_800_000_000, 0)
 	application.now = func() time.Time { return now }
-	discordClient := &fakeDiscord{interactionEdit: make(chan string, 4)}
+	application.successMessageTTL = 0
+	discordClient := &fakeDiscord{
+		interactionEdit:   make(chan string, 4),
+		interactionDelete: make(chan struct{}, 4),
+	}
 	zabbixClient := &fakeZabbix{
 		problem: zabbix.Problem{
 			EventID:  "101",
@@ -467,6 +482,7 @@ func TestInteractionRevalidatesTenantAndHostGroup(t *testing.T) {
 	}
 	close(zabbixClient.actionRelease)
 	result := <-discordClient.interactionEdit
+	<-discordClient.interactionDelete
 	if response.Code != http.StatusOK ||
 		!bytes.Contains(response.Body.Bytes(), []byte(`"type":5`)) ||
 		result != "Zabbix accepted the action." ||
