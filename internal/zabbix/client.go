@@ -73,6 +73,29 @@ type rpcError struct {
 	Data    string `json:"data"`
 }
 
+type apiID string
+
+func (id *apiID) UnmarshalJSON(raw []byte) error {
+	var value string
+	if len(raw) >= 2 && raw[0] == '"' {
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return err
+		}
+	} else {
+		value = string(raw)
+	}
+	if value == "" {
+		return errors.New("Zabbix API returned an empty ID")
+	}
+	for _, character := range value {
+		if character < '0' || character > '9' {
+			return errors.New("Zabbix API returned a non-decimal ID")
+		}
+	}
+	*id = apiID(value)
+	return nil
+}
+
 type Client struct {
 	url   string
 	token string
@@ -309,7 +332,7 @@ func (c *Client) Acknowledge(
 		params[key] = value
 	}
 	var result struct {
-		EventIDs []string `json:"eventids"`
+		EventIDs []apiID `json:"eventids"`
 	}
 	if err := c.call(ctx, "event.acknowledge", params, &result); err != nil {
 		var rejected *apiError
@@ -318,7 +341,7 @@ func (c *Client) Acknowledge(
 		}
 		return fmt.Errorf("%w: %v", ErrMutationOutcomeUnknown, err)
 	}
-	if len(result.EventIDs) != 1 || result.EventIDs[0] != eventID {
+	if len(result.EventIDs) != 1 || string(result.EventIDs[0]) != eventID {
 		return fmt.Errorf(
 			"%w: unexpected event.acknowledge result",
 			ErrMutationOutcomeUnknown,

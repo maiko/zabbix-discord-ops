@@ -70,6 +70,34 @@ func TestAcknowledgeKeepsZabbixAPIRejectionDefinitive(t *testing.T) {
 	}
 }
 
+func TestAcknowledgeAcceptsNumericAndStringEventIDs(t *testing.T) {
+	for _, eventIDs := range []string{`[101]`, `["101"]`} {
+		t.Run(eventIDs, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(
+				response http.ResponseWriter,
+				_ *http.Request,
+			) {
+				response.Header().Set("Content-Type", "application/json")
+				_, _ = response.Write([]byte(
+					`{"jsonrpc":"2.0","result":{"eventids":` + eventIDs + `},"id":1}`,
+				))
+			}))
+			defer server.Close()
+
+			client := NewClient(server.URL, "test-token")
+			if err := client.Acknowledge(
+				context.Background(),
+				"101",
+				ActionAcknowledge,
+				"ack",
+				nil,
+			); err != nil {
+				t.Fatalf("acknowledge event ID %s: %v", eventIDs, err)
+			}
+		})
+	}
+}
+
 func TestProblemsEnrichesAndFiltersDisabledTriggersInThreeBatchedCalls(t *testing.T) {
 	t.Helper()
 	var mu sync.Mutex
