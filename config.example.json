@@ -1,0 +1,43 @@
+{
+  "listen": "127.0.0.1:9088",
+  "display_name": "Zabbix Ops",
+  "public_base_url": "https://zabbix.infra.example.test",
+  "zabbix_url": "https://zabbix.infra.example.test/api_jsonrpc.php",
+  "state_path": "/var/lib/zabbix-discord-ops/correlations",
+  "state_review_after_days": 90,
+  "routing_tag": "notification_route",
+  "discord_api_url": "https://discord.com/api/v10",
+  "discord_bot_user_id": "000000000000000006",
+  "request_max_bytes": 1048576,
+  "routes": {
+    "lab": {
+      "guild_id": "000000000000000001",
+      "channel_id": "000000000000000002",
+      "required_tags": {
+        "tenant": "lab"
+      },
+      "required_host_group_ids": [
+        "101"
+      ],
+      "allowed_role_ids": [
+        "000000000000000003"
+      ],
+      "allowed_user_ids": []
+    },
+    "customer_prod": {
+      "guild_id": "000000000000000001",
+      "channel_id": "000000000000000004",
+      "required_tags": {
+        "tenant": "customer",
+        "impact": "prod"
+      },
+      "required_host_group_ids": [
+        "102"
+      ],
+      "allowed_role_ids": [
+        "000000000000000005"
+      ],
+      "allowed_user_ids": []
+    }
+  }
+}

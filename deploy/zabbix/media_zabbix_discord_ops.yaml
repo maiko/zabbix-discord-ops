@@ -1,0 +1,134 @@
+zabbix_export:
+  version: '7.4'
+  media_types:
+    - name: Zabbix Discord Ops
+      type: WEBHOOK
+      parameters:
+        - name: bot_url
+          value: '{$ZABBIX_DISCORD_OPS_URL}'
+        - name: event_clock
+          value: '{EVENT.TIMESTAMP}'
+        - name: event_host
+          value: '{HOST.NAME}'
+        - name: event_id
+          value: '{EVENT.ID}'
+        - name: event_message
+          value: '{ALERT.MESSAGE}'
+        - name: event_name
+          value: '{EVENT.NAME}'
+        - name: event_severity
+          value: '{EVENT.NSEVERITY}'
+        - name: event_severity_name
+          value: '{EVENT.SEVERITY}'
+        - name: event_source
+          value: '{EVENT.SOURCE}'
+        - name: event_tags
+          value: '{EVENT.TAGSJSON}'
+        - name: event_update_status
+          value: '{EVENT.UPDATE.STATUS}'
+        - name: event_url
+          value: '{$ZABBIX.URL}/tr_events.php?triggerid={TRIGGER.ID}&eventid={EVENT.ID}'
+        - name: event_value
+          value: '{EVENT.VALUE}'
+        - name: HTTPProxy
+          value: ''
+        - name: ingest_token
+          value: '{$ZABBIX_DISCORD_OPS_INGEST_TOKEN}'
+      status: DISABLED
+      attempts: '3'
+      attempt_interval: 10s
+      script: |
+        var params = JSON.parse(value),
+            request = new HttpRequest(),
+            payload,
+            response,
+            result,
+            status;
+
+        try {
+            if (params.event_source !== '0') {
+                throw 'Only trigger events are supported.';
+            }
+            if (params.event_value !== '0' && params.event_value !== '1') {
+                throw 'event_value must be 0 or 1.';
+            }
+            if (params.event_update_status !== '0' && params.event_update_status !== '1') {
+                throw 'event_update_status must be 0 or 1.';
+            }
+            if (!/^http:\/\/(127(?:\.\d{1,3}){3}|\[::1\]):\d+\/v1\/zabbix\/events$/.test(params.bot_url)) {
+                throw 'bot_url must be a loopback HTTP Zabbix event endpoint.';
+            }
+            if (typeof params.ingest_token !== 'string' || params.ingest_token.length < 32) {
+                throw 'ingest_token is missing or too short.';
+            }
+            if (typeof params.HTTPProxy === 'string' && params.HTTPProxy.trim() !== '') {
+                throw 'HTTPProxy is forbidden for the loopback bot endpoint.';
+            }
+
+            status = params.event_update_status === '1'
+                ? 'UPDATE'
+                : (params.event_value === '0' ? 'RESOLVED' : 'PROBLEM');
+            payload = {
+                event_id: params.event_id,
+                status: status,
+                severity: parseInt(params.event_severity, 10),
+                severity_name: params.event_severity_name,
+                name: params.event_name,
+                host: params.event_host,
+                clock: parseInt(params.event_clock, 10),
+                url: params.event_url,
+                message: params.event_message,
+                tags: JSON.parse(params.event_tags)
+            };
+            if (isNaN(payload.severity) || isNaN(payload.clock)) {
+                throw 'event severity or clock is not numeric.';
+            }
+
+            request.addHeader('Content-Type: application/json');
+            request.addHeader('Authorization: Bearer ' + params.ingest_token);
+            response = request.post(params.bot_url, JSON.stringify(payload));
+            if (request.getStatus() < 200 || request.getStatus() >= 300) {
+                throw 'Bot returned HTTP ' + request.getStatus() + '.';
+            }
+            result = JSON.parse(response);
+            if (typeof result !== 'object' || typeof result.tags !== 'object') {
+                throw 'Bot response does not contain a tags object.';
+            }
+            return JSON.stringify(result);
+        }
+        catch (error) {
+            Zabbix.log(3, '[ Zabbix Discord Ops ] ' + error);
+            throw 'Zabbix Discord Ops webhook failed: ' + error;
+        }
+      timeout: 10s
+      process_tags: 'YES'
+      description: |
+        Sends trigger problem, recovery, and update operations to a loopback-only
+        Zabbix Discord Ops service. Set {$ZABBIX_DISCORD_OPS_URL} to the local
+        /v1/zabbix/events endpoint and store the ingest credential in the secret
+        macro {$ZABBIX_DISCORD_OPS_INGEST_TOKEN}. Keep this media type disabled
+        until routes and tenant authorization have passed a canary. Three
+        attempts at ten-second intervals stay inside the bot's correlation and
+        reconciliation workflow.
+      message_templates:
+        - event_source: TRIGGERS
+          operation_mode: PROBLEM
+          subject: 'Problem: {EVENT.NAME}'
+          message: |
+            Problem started at {EVENT.TIME} on {EVENT.DATE}.
+            Host: {HOST.NAME}
+            Severity: {EVENT.SEVERITY}
+            Operational data: {EVENT.OPDATA}
+        - event_source: TRIGGERS
+          operation_mode: RECOVERY
+          subject: 'Resolved: {EVENT.NAME}'
+          message: |
+            Problem resolved at {EVENT.RECOVERY.TIME} on {EVENT.RECOVERY.DATE}.
+            Duration: {EVENT.DURATION}
+            Host: {HOST.NAME}
+        - event_source: TRIGGERS
+          operation_mode: UPDATE
+          subject: 'Updated: {EVENT.NAME}'
+          message: |
+            {USER.FULLNAME} {EVENT.UPDATE.ACTION} the problem.
+            {EVENT.UPDATE.MESSAGE}

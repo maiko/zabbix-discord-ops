@@ -1,0 +1,6 @@
+/build/
+/dist/
+/register-commands
+/zabbix-discord-ops
+/.env
+*.local

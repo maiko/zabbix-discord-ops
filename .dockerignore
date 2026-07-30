@@ -1,0 +1,10 @@
+*
+
+!go.mod
+!cmd/
+!cmd/zabbix-discord-ops/
+!cmd/zabbix-discord-ops/*.go
+!internal/
+!internal/**/*.go
+
+internal/**/*_test.go
