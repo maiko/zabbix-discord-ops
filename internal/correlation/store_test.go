@@ -40,6 +40,23 @@ func TestPendingCorrelationSurvivesRestartAndCompletes(t *testing.T) {
 	if err != nil || !existed || final.MessageID != "2001" {
 		t.Fatalf("completed correlation was not restored: %#v existed=%v err=%v", final, existed, err)
 	}
+	final, existed, err = finalStore.BeginMirror(
+		final,
+		"1007",
+		startedAt.Add(2*time.Minute),
+	)
+	if err != nil || existed {
+		t.Fatalf("mirror correlation was not started: %#v existed=%v err=%v", final, existed, err)
+	}
+	final, err = finalStore.CompleteMirror(final, "1007", "2007")
+	if err != nil || final.Version != recordVersion ||
+		final.MirrorMessages["1007"] != "2007" {
+		t.Fatalf("mirror correlation was not stored: %#v err=%v", final, err)
+	}
+	reloadedMirror, found, err := finalStore.Lookup("101", "prod")
+	if err != nil || !found || reloadedMirror.MirrorMessages["1007"] != "2007" {
+		t.Fatalf("mirror correlation was not restored: %#v found=%v err=%v", reloadedMirror, found, err)
+	}
 }
 
 func TestCountStaleCompletedPreservesEveryRecord(t *testing.T) {

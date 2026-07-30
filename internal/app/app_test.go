@@ -29,15 +29,20 @@ import (
 type fakeDiscord struct {
 	createdChannel    string
 	createdPayload    any
+	createdChannels   []string
+	createdPayloads   []any
 	createCount       int
 	editedChannel     string
 	editedMessage     string
+	editedChannels    []string
+	editedMessages    []string
 	foundMessage      discord.Message
 	findMessage       bool
 	findCount         int
 	createStarted     chan struct{}
 	createRelease     chan struct{}
 	createStartOnce   sync.Once
+	nonceMessages     map[string]discord.Message
 	botUserID         string
 	interactionEdit   chan string
 	interactionDelete chan struct{}
@@ -56,9 +61,19 @@ func (f *fakeDiscord) CreateMessage(
 	channelID string,
 	payload any,
 ) (discord.Message, error) {
+	messagePayload, _ := payload.(map[string]any)
+	nonce, _ := messagePayload["nonce"].(string)
+	enforceNonce, _ := messagePayload["enforce_nonce"].(bool)
+	if enforceNonce {
+		if existing, found := f.nonceMessages[nonce]; found {
+			return existing, nil
+		}
+	}
 	f.createCount++
 	f.createdChannel = channelID
 	f.createdPayload = payload
+	f.createdChannels = append(f.createdChannels, channelID)
+	f.createdPayloads = append(f.createdPayloads, payload)
 	if f.createStarted != nil {
 		f.createStartOnce.Do(func() { close(f.createStarted) })
 	}
@@ -69,11 +84,15 @@ func (f *fakeDiscord) CreateMessage(
 			return discord.Message{}, ctx.Err()
 		}
 	}
-	return discord.Message{
-		ID:        "2001",
+	message := discord.Message{
+		ID:        strconv.Itoa(2000 + f.createCount),
 		ChannelID: channelID,
 		Author:    discord.User{ID: "1006"},
-	}, nil
+	}
+	if enforceNonce {
+		f.nonceMessages[nonce] = message
+	}
+	return message, nil
 }
 
 func (f *fakeDiscord) FindMessageByNonce(
@@ -92,6 +111,8 @@ func (f *fakeDiscord) EditMessage(
 ) error {
 	f.editedChannel = channelID
 	f.editedMessage = messageID
+	f.editedChannels = append(f.editedChannels, channelID)
+	f.editedMessages = append(f.editedMessages, messageID)
 	return nil
 }
 
@@ -203,6 +224,7 @@ func testApp(t *testing.T) (*App, ed25519.PrivateKey, *fakeDiscord, *fakeZabbix)
 	discordClient := &fakeDiscord{
 		interactionEdit:   make(chan string, 4),
 		interactionDelete: make(chan struct{}, 4),
+		nonceMessages:     map[string]discord.Message{},
 	}
 	zabbixClient := &fakeZabbix{
 		problem: zabbix.Problem{
@@ -309,6 +331,102 @@ func TestIngestCreatesCorrelatedMessage(t *testing.T) {
 			"durable retry created another message: status=%d creates=%d",
 			response.Code,
 			discordClient.createCount,
+		)
+	}
+}
+
+func TestIngestMirrorsProblemAndRecoveryWithoutInteractiveComponents(t *testing.T) {
+	application, _, discordClient, _ := testApp(t)
+	route := application.cfg.Routes["prod"]
+	route.MirrorChannelIDs = []string{"1007"}
+	application.cfg.Routes["prod"] = route
+
+	problem := IngestEvent{
+		EventID:  "101",
+		Status:   "PROBLEM",
+		Severity: 4,
+		Name:     "Service unavailable",
+		Host:     "service.example.test",
+		Clock:    application.now().Unix(),
+		Tags: []zabbix.Tag{
+			{Tag: "notification_route", Value: "prod"},
+			{Tag: "tenant", Value: "example"},
+		},
+	}
+	body, _ := json.Marshal(problem)
+	request := httptest.NewRequest(http.MethodPost, "/v1/zabbix/events", bytes.NewReader(body))
+	request.Header.Set("Authorization", "Bearer "+application.ingestToken)
+	response := httptest.NewRecorder()
+	application.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("problem ingest failed: %d %s", response.Code, response.Body.String())
+	}
+	if fmt.Sprint(discordClient.createdChannels) != "[1002 1007]" {
+		t.Fatalf("unexpected problem destinations: %#v", discordClient.createdChannels)
+	}
+	primary := discordClient.createdPayloads[0].(map[string]any)
+	mirror := discordClient.createdPayloads[1].(map[string]any)
+	if len(primary["components"].([]any)) == 0 ||
+		len(mirror["components"].([]any)) != 0 {
+		t.Fatal("mirror did not remove interactive components")
+	}
+	if primary["nonce"] == mirror["nonce"] ||
+		mirror["nonce"] != mirrorNonce(problem.EventID, "1007") {
+		t.Fatalf(
+			"mirror nonce is not destination-specific: primary=%v mirror=%v",
+			primary["nonce"],
+			mirror["nonce"],
+		)
+	}
+	if !bytes.Contains(response.Body.Bytes(), []byte(`"zbx_discord_ops_message_id":"2001"`)) {
+		t.Fatalf("primary correlation was not returned: %s", response.Body.String())
+	}
+
+	update := problem
+	update.Status = "UPDATE"
+	update.Tags = append(update.Tags,
+		zabbix.Tag{Tag: "zbx_discord_ops_message_id", Value: "2001"},
+		zabbix.Tag{Tag: "zbx_discord_ops_channel_id", Value: "1002"},
+		zabbix.Tag{Tag: "zbx_discord_ops_route", Value: "prod"},
+	)
+	body, _ = json.Marshal(update)
+	request = httptest.NewRequest(http.MethodPost, "/v1/zabbix/events", bytes.NewReader(body))
+	request.Header.Set("Authorization", "Bearer "+application.ingestToken)
+	response = httptest.NewRecorder()
+	application.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("update ingest failed: %d %s", response.Code, response.Body.String())
+	}
+	if fmt.Sprint(discordClient.editedChannels) != "[1002 1007]" ||
+		fmt.Sprint(discordClient.editedMessages) != "[2001 2002]" {
+		t.Fatalf(
+			"unexpected update destinations: channels=%#v messages=%#v",
+			discordClient.editedChannels,
+			discordClient.editedMessages,
+		)
+	}
+
+	route = application.cfg.Routes["prod"]
+	route.MirrorChannelIDs = nil
+	application.cfg.Routes["prod"] = route
+	discordClient.editedChannels = nil
+	discordClient.editedMessages = nil
+	recovery := update
+	recovery.Status = "RESOLVED"
+	body, _ = json.Marshal(recovery)
+	request = httptest.NewRequest(http.MethodPost, "/v1/zabbix/events", bytes.NewReader(body))
+	request.Header.Set("Authorization", "Bearer "+application.ingestToken)
+	response = httptest.NewRecorder()
+	application.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("recovery ingest failed: %d %s", response.Code, response.Body.String())
+	}
+	if fmt.Sprint(discordClient.editedChannels) != "[1002]" ||
+		fmt.Sprint(discordClient.editedMessages) != "[2001]" {
+		t.Fatalf(
+			"removed mirror received recovery: channels=%#v messages=%#v",
+			discordClient.editedChannels,
+			discordClient.editedMessages,
 		)
 	}
 }

@@ -27,6 +27,9 @@
     "customer_prod": {
       "guild_id": "000000000000000001",
       "channel_id": "000000000000000004",
+      "mirror_channel_ids": [
+        "000000000000000007"
+      ],
       "required_tags": {
         "tenant": "customer",
         "impact": "prod"

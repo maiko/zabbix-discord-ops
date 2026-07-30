@@ -13,16 +13,21 @@ import (
 	"time"
 )
 
-const recordVersion = 1
+const (
+	legacyRecordVersion = 1
+	recordVersion       = 2
+)
 
 type Record struct {
-	Version     int        `json:"version"`
-	EventID     string     `json:"event_id"`
-	Route       string     `json:"route"`
-	ChannelID   string     `json:"channel_id"`
-	MessageID   string     `json:"message_id,omitempty"`
-	StartedAt   time.Time  `json:"started_at"`
-	CompletedAt *time.Time `json:"completed_at,omitempty"`
+	Version         int                  `json:"version"`
+	EventID         string               `json:"event_id"`
+	Route           string               `json:"route"`
+	ChannelID       string               `json:"channel_id"`
+	MessageID       string               `json:"message_id,omitempty"`
+	MirrorStartedAt map[string]time.Time `json:"mirror_started_at,omitempty"`
+	MirrorMessages  map[string]string    `json:"mirror_messages,omitempty"`
+	StartedAt       time.Time            `json:"started_at"`
+	CompletedAt     *time.Time           `json:"completed_at,omitempty"`
 }
 
 type Store struct {
@@ -97,6 +102,85 @@ func (s *Store) Complete(
 		return Record{}, err
 	}
 	return current, nil
+}
+
+func (s *Store) CompleteMirror(
+	record Record,
+	channelID, messageID string,
+) (Record, error) {
+	path := s.recordPath(record.EventID, record.Route)
+	current, err := readRecord(path)
+	if err != nil {
+		return Record{}, err
+	}
+	if current.EventID != record.EventID ||
+		current.Route != record.Route ||
+		current.ChannelID != record.ChannelID ||
+		current.MessageID == "" {
+		return Record{}, errors.New("correlation changed before mirror completion")
+	}
+	if channelID == "" || channelID == current.ChannelID || messageID == "" {
+		return Record{}, errors.New("invalid mirror correlation identity")
+	}
+	if current.MirrorStartedAt[channelID].IsZero() {
+		return Record{}, errors.New("mirror correlation was not started")
+	}
+	if current.MirrorMessages == nil {
+		current.MirrorMessages = map[string]string{}
+	}
+	if existing := current.MirrorMessages[channelID]; existing != "" {
+		if existing != messageID {
+			return Record{}, errors.New("mirror correlation already points to another Discord message")
+		}
+		return current, nil
+	}
+	current.Version = recordVersion
+	current.MirrorMessages[channelID] = messageID
+	if err := writeRecord(path, current); err != nil {
+		return Record{}, err
+	}
+	return current, nil
+}
+
+func (s *Store) BeginMirror(
+	record Record,
+	channelID string,
+	startedAt time.Time,
+) (Record, bool, error) {
+	path := s.recordPath(record.EventID, record.Route)
+	current, err := readRecord(path)
+	if err != nil {
+		return Record{}, false, err
+	}
+	if current.EventID != record.EventID ||
+		current.Route != record.Route ||
+		current.ChannelID != record.ChannelID ||
+		current.MessageID == "" {
+		return Record{}, false, errors.New("correlation changed before mirror start")
+	}
+	if channelID == "" || channelID == current.ChannelID || startedAt.IsZero() {
+		return Record{}, false, errors.New("invalid mirror correlation identity")
+	}
+	if existing := current.MirrorStartedAt[channelID]; !existing.IsZero() {
+		return current, true, nil
+	}
+	if current.MirrorStartedAt == nil {
+		current.MirrorStartedAt = map[string]time.Time{}
+	}
+	current.Version = recordVersion
+	current.MirrorStartedAt[channelID] = startedAt.UTC()
+	if err := writeRecord(path, current); err != nil {
+		return Record{}, false, err
+	}
+	return current, false, nil
+}
+
+func (s *Store) Lookup(eventID, route string) (Record, bool, error) {
+	record, err := readRecord(s.recordPath(eventID, route))
+	if errors.Is(err, os.ErrNotExist) {
+		return Record{}, false, nil
+	}
+	return record, err == nil, err
 }
 
 func (s *Store) CountStaleCompleted(
@@ -182,13 +266,27 @@ func readRecord(path string) (Record, error) {
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		return record, errors.New("decode correlation record: trailing JSON content")
 	}
-	if record.Version != recordVersion ||
+	if (record.Version != legacyRecordVersion && record.Version != recordVersion) ||
 		record.EventID == "" ||
 		record.Route == "" ||
 		record.ChannelID == "" ||
 		record.StartedAt.IsZero() ||
 		(record.MessageID == "") != (record.CompletedAt == nil) {
 		return record, errors.New("invalid correlation record")
+	}
+	if record.Version == legacyRecordVersion &&
+		(len(record.MirrorStartedAt) != 0 || len(record.MirrorMessages) != 0) {
+		return record, errors.New("legacy correlation record contains mirror messages")
+	}
+	for channelID, startedAt := range record.MirrorStartedAt {
+		if channelID == "" || channelID == record.ChannelID || startedAt.IsZero() {
+			return record, errors.New("invalid mirror correlation record")
+		}
+	}
+	for channelID, messageID := range record.MirrorMessages {
+		if record.MirrorStartedAt[channelID].IsZero() || messageID == "" {
+			return record, errors.New("invalid mirror correlation record")
+		}
 	}
 	return record, nil
 }

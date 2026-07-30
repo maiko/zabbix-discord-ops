@@ -113,6 +113,13 @@ Set `discord_bot_user_id` to this bot user's numeric ID. Reconciliation accepts
 only messages authored by that exact bot, because Discord nonce uniqueness is
 scoped to the author.
 
+Each route has one interactive `channel_id` and may define
+`mirror_channel_ids`. Mirrors receive the same problem, update, and recovery
+cards without interactive components. This supports a private global
+operations channel plus read-only tenant channels without granting tenant
+members mutation rights. The bot needs the same channel permissions in every
+mirror.
+
 Set the application's interaction endpoint to:
 
 ```text
@@ -181,8 +188,10 @@ Define:
 - `{$ZABBIX.URL}` as the canonical HTTPS frontend URL.
 
 The webhook rejects non-trigger events, non-loopback destinations, and HTTP
-proxies. It returns Discord message correlation IDs as Zabbix event tags, so
-recovery and update operations edit the original Discord message.
+proxies. It returns the primary Discord message correlation IDs as Zabbix
+event tags, so recovery and update operations edit the original message.
+Mirror message IDs remain in the private correlation store and are updated in
+the same ingest transaction.
 
 Before problem creation, the service durably records a pending event. It then
 uses the numeric Zabbix event ID as a Discord nonce with `enforce_nonce`

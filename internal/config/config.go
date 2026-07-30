@@ -22,6 +22,7 @@ var (
 type Route struct {
 	GuildID             string            `json:"guild_id"`
 	ChannelID           string            `json:"channel_id"`
+	MirrorChannelIDs    []string          `json:"mirror_channel_ids"`
 	RequiredTags        map[string]string `json:"required_tags"`
 	RequiredHostGroupID []string          `json:"required_host_group_ids"`
 	AllowedRoleIDs      []string          `json:"allowed_role_ids"`
@@ -133,6 +134,19 @@ func (c Config) Validate() error {
 		if !snowflakePattern.MatchString(route.GuildID) ||
 			!snowflakePattern.MatchString(route.ChannelID) {
 			return fmt.Errorf("route %q requires numeric Discord guild and channel IDs", name)
+		}
+		if len(route.MirrorChannelIDs) > 8 {
+			return fmt.Errorf("route %q exceeds eight Discord mirror channels", name)
+		}
+		channels := map[string]struct{}{route.ChannelID: {}}
+		for _, channelID := range route.MirrorChannelIDs {
+			if !snowflakePattern.MatchString(channelID) {
+				return fmt.Errorf("route %q has a non-numeric Discord mirror channel ID", name)
+			}
+			if _, exists := channels[channelID]; exists {
+				return fmt.Errorf("route %q repeats a Discord destination channel", name)
+			}
+			channels[channelID] = struct{}{}
 		}
 		if len(route.AllowedRoleIDs) == 0 && len(route.AllowedUserIDs) == 0 {
 			return fmt.Errorf("route %q requires an allowed role or user", name)

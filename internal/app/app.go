@@ -2,7 +2,9 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -778,49 +780,101 @@ func (a *App) handleIngest(response http.ResponseWriter, request *http.Request) 
 			a.fail(response, "persist pending Discord correlation", err)
 			return
 		}
-		if record.MessageID != "" {
-			a.metrics.ingested.Add(1)
-			writeJSON(response, http.StatusOK, map[string]any{
-				"tags": correlationTags(record),
-			})
-			return
-		}
-
-		var message discord.Message
-		var found bool
-		if existed {
-			message, found, err = a.discord.FindMessageByNonce(
-				operationContext,
-				route.ChannelID,
-				event.EventID,
-				record.StartedAt,
-			)
+		if record.MessageID == "" {
+			var message discord.Message
+			var found bool
+			if existed {
+				message, found, err = a.discord.FindMessageByNonce(
+					operationContext,
+					route.ChannelID,
+					event.EventID,
+					record.StartedAt,
+				)
+				if err != nil {
+					a.fail(response, "reconcile pending Discord message", err)
+					return
+				}
+			}
+			if !found {
+				message, err = a.discord.CreateMessage(
+					operationContext,
+					route.ChannelID,
+					payload,
+				)
+			}
 			if err != nil {
-				a.fail(response, "reconcile pending Discord message", err)
+				a.fail(response, "create Discord message", err)
+				return
+			}
+			if !expectedDiscordMessage(
+				message,
+				route.ChannelID,
+				a.cfg.DiscordBotUserID,
+			) {
+				a.fail(response, "create Discord message", errors.New("unexpected message identity"))
+				return
+			}
+			record, err = a.correlations.Complete(record, message.ID, a.now())
+			if err != nil {
+				a.fail(response, "persist Discord correlation", err)
 				return
 			}
 		}
-		if !found {
-			message, err = a.discord.CreateMessage(
-				operationContext,
-				route.ChannelID,
-				payload,
+
+		for _, channelID := range route.MirrorChannelIDs {
+			if record.MirrorMessages[channelID] != "" {
+				continue
+			}
+			var mirrorExisted bool
+			record, mirrorExisted, err = a.correlations.BeginMirror(
+				record,
+				channelID,
+				a.now(),
 			)
-		}
-		if err != nil {
-			a.fail(response, "create Discord message", err)
-			return
-		}
-		if !isDecimalID(message.ID) ||
-			message.ChannelID != route.ChannelID ||
-			message.Author.ID != a.cfg.DiscordBotUserID {
-			a.fail(response, "create Discord message", errors.New("unexpected message identity"))
-			return
-		}
-		record, err = a.correlations.Complete(record, message.ID, a.now())
-		if err != nil {
-			a.fail(response, "persist Discord correlation", err)
-			return
+			if err != nil {
+				a.fail(response, "persist pending Discord mirror", err)
+				return
+			}
+			var message discord.Message
+			var found bool
+			if mirrorExisted {
+				message, found, err = a.discord.FindMessageByNonce(
+					operationContext,
+					channelID,
+					mirrorNonce(event.EventID, channelID),
+					record.MirrorStartedAt[channelID],
+				)
+				if err != nil {
+					a.fail(response, "reconcile pending Discord mirror", err)
+					return
+				}
+			}
+			if !found {
+				mirrorPayload := readOnlyDiscordMessage(payload)
+				mirrorPayload["nonce"] = mirrorNonce(event.EventID, channelID)
+				message, err = a.discord.CreateMessage(
+					operationContext,
+					channelID,
+					mirrorPayload,
+				)
+			}
+			if err != nil {
+				a.fail(response, "create Discord mirror", err)
+				return
+			}
+			if !expectedDiscordMessage(message, channelID, a.cfg.DiscordBotUserID) {
+				a.fail(response, "create Discord mirror", errors.New("unexpected message identity"))
+				return
+			}
+			record, err = a.correlations.CompleteMirror(
+				record,
+				channelID,
+				message.ID,
+			)
+			if err != nil {
+				a.fail(response, "persist Discord mirror correlation", err)
+				return
+			}
 		}
 		resultTags = correlationTags(record)
 	} else {
@@ -841,9 +895,56 @@ func (a *App) handleIngest(response http.ResponseWriter, request *http.Request) 
 			a.fail(response, "edit Discord message", err)
 			return
 		}
+		record, found, err := a.correlations.Lookup(event.EventID, routeName)
+		if err != nil {
+			a.fail(response, "read Discord mirror correlations", err)
+			return
+		}
+		if found {
+			if record.ChannelID != channelID || record.MessageID != messageID {
+				http.Error(response, "mismatched Discord correlation state", http.StatusUnprocessableEntity)
+				return
+			}
+			mirrorPayload := readOnlyDiscordMessage(payload)
+			for _, mirrorChannelID := range route.MirrorChannelIDs {
+				mirrorMessageID := record.MirrorMessages[mirrorChannelID]
+				if mirrorMessageID == "" {
+					continue
+				}
+				if err := a.discord.EditMessage(
+					operationContext,
+					mirrorChannelID,
+					mirrorMessageID,
+					mirrorPayload,
+				); err != nil {
+					a.fail(response, "edit Discord mirror", err)
+					return
+				}
+			}
+		}
 	}
 	a.metrics.ingested.Add(1)
 	writeJSON(response, http.StatusOK, map[string]any{"tags": resultTags})
+}
+
+func expectedDiscordMessage(message discord.Message, channelID, botUserID string) bool {
+	return isDecimalID(message.ID) &&
+		message.ChannelID == channelID &&
+		message.Author.ID == botUserID
+}
+
+func readOnlyDiscordMessage(payload map[string]any) map[string]any {
+	result := make(map[string]any, len(payload))
+	for key, value := range payload {
+		result[key] = value
+	}
+	result["components"] = []any{}
+	return result
+}
+
+func mirrorNonce(eventID, channelID string) string {
+	digest := sha256.Sum256([]byte("discord-mirror\x00" + eventID + "\x00" + channelID))
+	return strconv.FormatUint(binary.BigEndian.Uint64(digest[:8]), 10)
 }
 
 func validateIngestEvent(event IngestEvent) error {

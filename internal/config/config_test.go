@@ -42,6 +42,12 @@ func TestConfigRequiresLoopbackAndExplicitAuthorization(t *testing.T) {
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("valid config rejected: %v", err)
 	}
+	route := cfg.Routes["prod"]
+	route.MirrorChannelIDs = []string{"2"}
+	cfg.Routes["prod"] = route
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected duplicate primary and mirror channel rejection")
+	}
 }
 
 func TestReadProtectedTextFileRejectsSymlink(t *testing.T) {
