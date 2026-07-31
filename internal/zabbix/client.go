@@ -31,9 +31,14 @@ type Tag struct {
 }
 
 type Host struct {
-	HostID string `json:"hostid"`
-	Host   string `json:"host"`
-	Name   string `json:"name"`
+	HostID            string      `json:"hostid"`
+	Host              string      `json:"host"`
+	Name              string      `json:"name"`
+	Status            string      `json:"status"`
+	MaintenanceStatus string      `json:"maintenance_status"`
+	MaintenanceID     string      `json:"maintenanceid"`
+	Groups            []HostGroup `json:"hostgroups"`
+	Tags              []Tag       `json:"tags"`
 }
 
 type HostGroup struct {
@@ -53,6 +58,31 @@ type Problem struct {
 	Hosts         []Host      `json:"-"`
 	HostGroups    []HostGroup `json:"-"`
 	TriggerStatus string      `json:"-"`
+}
+
+type Maintenance struct {
+	MaintenanceID   string       `json:"maintenanceid"`
+	Name            string       `json:"name"`
+	Description     string       `json:"description"`
+	MaintenanceType string       `json:"maintenance_type"`
+	ActiveSince     string       `json:"active_since"`
+	ActiveTill      string       `json:"active_till"`
+	Hosts           []Host       `json:"hosts"`
+	HostGroups      []HostGroup  `json:"hostgroups"`
+	Timeperiods     []Timeperiod `json:"timeperiods"`
+	Tags            []Tag        `json:"tags"`
+}
+
+type Timeperiod struct {
+	TimeperiodID   string `json:"timeperiodid,omitempty"`
+	TimeperiodType string `json:"timeperiod_type"`
+	Every          string `json:"every,omitempty"`
+	Month          string `json:"month,omitempty"`
+	DayOfWeek      string `json:"dayofweek,omitempty"`
+	Day            string `json:"day,omitempty"`
+	StartTime      string `json:"start_time,omitempty"`
+	Period         string `json:"period"`
+	StartDate      string `json:"start_date,omitempty"`
 }
 
 type rpcRequest struct {
@@ -109,6 +139,161 @@ func NewClient(url, token string) *Client {
 		token: token,
 		http:  &http.Client{Timeout: 8 * time.Second},
 	}
+}
+
+func (c *Client) Hosts(ctx context.Context, hostIDs []string) ([]Host, error) {
+	params := map[string]any{
+		"output": []string{
+			"hostid", "host", "name", "status", "maintenance_status", "maintenanceid",
+		},
+		"selectHostGroups": []string{"groupid", "name"},
+		"selectTags":       []string{"tag", "value"},
+		"sortfield":        []string{"name"},
+	}
+	if len(hostIDs) > 0 {
+		params["hostids"] = hostIDs
+	}
+	var hosts []Host
+	if err := c.call(ctx, "host.get", params, &hosts); err != nil {
+		return nil, err
+	}
+	return hosts, nil
+}
+
+func (c *Client) HostsByMaintenance(
+	ctx context.Context,
+	maintenanceIDs []string,
+) ([]Host, error) {
+	if len(maintenanceIDs) == 0 {
+		return nil, nil
+	}
+	var hosts []Host
+	if err := c.call(ctx, "host.get", map[string]any{
+		"output": []string{
+			"hostid", "host", "name", "status", "maintenance_status", "maintenanceid",
+		},
+		"maintenanceids":   maintenanceIDs,
+		"selectHostGroups": []string{"groupid", "name"},
+		"selectTags":       []string{"tag", "value"},
+		"sortfield":        []string{"name"},
+	}, &hosts); err != nil {
+		return nil, err
+	}
+	return hosts, nil
+}
+
+func (c *Client) HostsByGroups(
+	ctx context.Context,
+	groupIDs []string,
+) ([]Host, error) {
+	if len(groupIDs) == 0 {
+		return nil, nil
+	}
+	var hosts []Host
+	if err := c.call(ctx, "host.get", map[string]any{
+		"output": []string{
+			"hostid", "host", "name", "status", "maintenance_status", "maintenanceid",
+		},
+		"groupids":         groupIDs,
+		"selectHostGroups": []string{"groupid", "name"},
+		"selectTags":       []string{"tag", "value"},
+		"sortfield":        []string{"name"},
+	}, &hosts); err != nil {
+		return nil, err
+	}
+	return hosts, nil
+}
+
+func (c *Client) Maintenances(
+	ctx context.Context,
+	maintenanceIDs []string,
+) ([]Maintenance, error) {
+	params := map[string]any{
+		"output": []string{
+			"maintenanceid", "name", "description", "maintenance_type",
+			"active_since", "active_till",
+		},
+		"editable":          true,
+		"selectHosts":       []string{"hostid", "host", "name"},
+		"selectHostGroups":  []string{"groupid", "name"},
+		"selectTimeperiods": "extend",
+		"selectTags":        []string{"tag", "value"},
+		"sortfield":         []string{"maintenanceid"},
+		"sortorder":         "DESC",
+	}
+	if len(maintenanceIDs) > 0 {
+		params["maintenanceids"] = maintenanceIDs
+	}
+	var maintenances []Maintenance
+	if err := c.call(ctx, "maintenance.get", params, &maintenances); err != nil {
+		return nil, err
+	}
+	return maintenances, nil
+}
+
+func (c *Client) CreateMaintenance(
+	ctx context.Context,
+	params map[string]any,
+) (string, error) {
+	var result struct {
+		MaintenanceIDs []apiID `json:"maintenanceids"`
+	}
+	if err := c.call(ctx, "maintenance.create", params, &result); err != nil {
+		var rejected *apiError
+		if errors.As(err, &rejected) {
+			return "", err
+		}
+		return "", fmt.Errorf("%w: %v", ErrMutationOutcomeUnknown, err)
+	}
+	if len(result.MaintenanceIDs) != 1 {
+		return "", fmt.Errorf("%w: unexpected maintenance.create result", ErrMutationOutcomeUnknown)
+	}
+	return string(result.MaintenanceIDs[0]), nil
+}
+
+func (c *Client) UpdateMaintenance(
+	ctx context.Context,
+	params map[string]any,
+) error {
+	expected, _ := params["maintenanceid"].(string)
+	var result struct {
+		MaintenanceIDs []apiID `json:"maintenanceids"`
+	}
+	if err := c.call(ctx, "maintenance.update", params, &result); err != nil {
+		var rejected *apiError
+		if errors.As(err, &rejected) {
+			return err
+		}
+		return fmt.Errorf("%w: %v", ErrMutationOutcomeUnknown, err)
+	}
+	if len(result.MaintenanceIDs) != 1 ||
+		(expected != "" && string(result.MaintenanceIDs[0]) != expected) {
+		return fmt.Errorf("%w: unexpected maintenance.update result", ErrMutationOutcomeUnknown)
+	}
+	return nil
+}
+
+func (c *Client) DeleteMaintenance(ctx context.Context, maintenanceID string) error {
+	var result struct {
+		MaintenanceIDs []apiID `json:"maintenanceids"`
+	}
+	if err := c.call(
+		ctx,
+		"maintenance.delete",
+		[]string{maintenanceID},
+		&result,
+	); err != nil {
+		var rejected *apiError
+		if errors.As(err, &rejected) {
+			return err
+		}
+		return fmt.Errorf("%w: %v", ErrMutationOutcomeUnknown, err)
+	}
+	if len(result.MaintenanceIDs) != 1 ||
+		string(result.MaintenanceIDs[0]) != maintenanceID {
+		return fmt.Errorf("%w: unexpected maintenance.delete result", ErrMutationOutcomeUnknown)
+	}
+	return nil
 }
 
 func (c *Client) call(ctx context.Context, method string, params, result any) error {

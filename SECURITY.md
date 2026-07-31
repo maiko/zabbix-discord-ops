@@ -25,6 +25,8 @@ The main security boundaries are documented in the README. In particular:
 - Zabbix ingestion and metrics must remain on loopback;
 - route authorization requires Discord identity, Zabbix tags, and Zabbix host
   group membership;
+- maintenance mutations use a separate least-privilege token, durable
+  single-use intents, and live whole-object authorization;
 - secrets must be loaded from protected credential files, never JSON config,
   command-line flags, container build arguments, or Git.
 

@@ -21,7 +21,9 @@ type InteractionData struct {
 
 type InteractionOption struct {
 	Name    string              `json:"name"`
+	Type    int                 `json:"type"`
 	Value   any                 `json:"value"`
+	Focused bool                `json:"focused"`
 	Options []InteractionOption `json:"options"`
 }
 

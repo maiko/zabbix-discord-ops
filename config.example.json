@@ -16,6 +16,12 @@
       "required_tags": {
         "tenant": "lab"
       },
+      "host_match_tags": {
+        "tenant": "lab"
+      },
+      "maintenance_enabled": false,
+      "maintenance_host_ids": [],
+      "maintenance_cancel_allowed_user_ids": [],
       "required_host_group_ids": [
         "101"
       ],
@@ -34,6 +40,12 @@
         "tenant": "customer",
         "impact": "prod"
       },
+      "host_match_tags": {
+        "tenant": "customer"
+      },
+      "maintenance_enabled": false,
+      "maintenance_host_ids": [],
+      "maintenance_cancel_allowed_user_ids": [],
       "required_host_group_ids": [
         "102"
       ],

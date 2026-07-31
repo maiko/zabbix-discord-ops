@@ -20,13 +20,17 @@ var (
 )
 
 type Route struct {
-	GuildID             string            `json:"guild_id"`
-	ChannelID           string            `json:"channel_id"`
-	MirrorChannelIDs    []string          `json:"mirror_channel_ids"`
-	RequiredTags        map[string]string `json:"required_tags"`
-	RequiredHostGroupID []string          `json:"required_host_group_ids"`
-	AllowedRoleIDs      []string          `json:"allowed_role_ids"`
-	AllowedUserIDs      []string          `json:"allowed_user_ids"`
+	GuildID                         string            `json:"guild_id"`
+	ChannelID                       string            `json:"channel_id"`
+	MirrorChannelIDs                []string          `json:"mirror_channel_ids"`
+	RequiredTags                    map[string]string `json:"required_tags"`
+	HostMatchTags                   map[string]string `json:"host_match_tags,omitempty"`
+	RequiredHostGroupID             []string          `json:"required_host_group_ids"`
+	AllowedRoleIDs                  []string          `json:"allowed_role_ids"`
+	AllowedUserIDs                  []string          `json:"allowed_user_ids"`
+	MaintenanceEnabled              bool              `json:"maintenance_enabled,omitempty"`
+	MaintenanceHostIDs              []string          `json:"maintenance_host_ids,omitempty"`
+	MaintenanceCancelAllowedUserIDs []string          `json:"maintenance_cancel_allowed_user_ids,omitempty"`
 }
 
 type Config struct {
@@ -44,11 +48,12 @@ type Config struct {
 }
 
 type Secrets struct {
-	DiscordBotToken     string
-	DiscordPublicKey    []byte
-	ZabbixAPIToken      string
-	IngestToken         string
-	ComponentSigningKey []byte
+	DiscordBotToken           string
+	DiscordPublicKey          []byte
+	ZabbixAPIToken            string
+	ZabbixMaintenanceAPIToken string
+	IngestToken               string
+	ComponentSigningKey       []byte
 }
 
 func Load(path string) (Config, error) {
@@ -172,6 +177,22 @@ func (c Config) Validate() error {
 				return fmt.Errorf("route %q has a non-numeric Zabbix host group ID", name)
 			}
 		}
+		if route.MaintenanceEnabled && len(route.HostMatchTags) == 0 {
+			return fmt.Errorf("route %q requires host_match_tags when maintenance is enabled", name)
+		}
+		for tag, value := range route.HostMatchTags {
+			if strings.TrimSpace(tag) == "" || strings.TrimSpace(value) == "" {
+				return fmt.Errorf("route %q has an empty host match tag or value", name)
+			}
+		}
+		for _, value := range append(
+			append([]string{}, route.MaintenanceHostIDs...),
+			route.MaintenanceCancelAllowedUserIDs...,
+		) {
+			if !snowflakePattern.MatchString(value) {
+				return fmt.Errorf("route %q has a non-numeric maintenance authorization ID", name)
+			}
+		}
 	}
 	if c.RequestMaxBytes < 1024 || c.RequestMaxBytes > 10<<20 {
 		return errors.New("request_max_bytes must be between 1024 and 10485760")
@@ -215,6 +236,13 @@ func LoadSecrets() (Secrets, error) {
 	if err != nil {
 		return Secrets{}, err
 	}
+	zabbixMaintenanceToken, err := read(
+		"ZABBIX_MAINTENANCE_API_TOKEN_FILE",
+		"zabbix-maintenance-api-token",
+	)
+	if err != nil {
+		return Secrets{}, err
+	}
 	ingestToken, err := read("INGEST_TOKEN_FILE", "ingest-token")
 	if err != nil {
 		return Secrets{}, err
@@ -227,15 +255,17 @@ func LoadSecrets() (Secrets, error) {
 	if err != nil || len(signingKey) < 32 {
 		return Secrets{}, errors.New("component signing key must be at least 32-byte hex")
 	}
-	if len(ingestToken) < 32 || len(zabbixToken) < 16 || len(botToken) < 16 {
+	if len(ingestToken) < 32 || len(zabbixToken) < 16 ||
+		len(zabbixMaintenanceToken) < 16 || len(botToken) < 16 {
 		return Secrets{}, errors.New("one or more credentials are implausibly short")
 	}
 	return Secrets{
-		DiscordBotToken:     botToken,
-		DiscordPublicKey:    publicKey,
-		ZabbixAPIToken:      zabbixToken,
-		IngestToken:         ingestToken,
-		ComponentSigningKey: signingKey,
+		DiscordBotToken:           botToken,
+		DiscordPublicKey:          publicKey,
+		ZabbixAPIToken:            zabbixToken,
+		ZabbixMaintenanceAPIToken: zabbixMaintenanceToken,
+		IngestToken:               ingestToken,
+		ComponentSigningKey:       signingKey,
 	}, nil
 }
 

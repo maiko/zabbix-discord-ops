@@ -102,3 +102,32 @@ func TestComponentSignerFitsDiscordLimitAtMaximumInput(t *testing.T) {
 		t.Fatalf("custom ID has %d characters", len(value))
 	}
 }
+
+func TestMaintenanceCancelSignerBindsUserAndFitsDiscordLimit(t *testing.T) {
+	signer, err := NewSigner([]byte("0123456789abcdef0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(1_800_000_000, 0)
+	want := ComponentToken{
+		Action:        "maintenance-cancel-confirm",
+		EventID:       "18446744073709551615",
+		Route:         "tenant-prod-route-123456",
+		SubjectUserID: "18446744073709551615",
+		Expires:       now.Add(5 * time.Minute).Unix(),
+	}
+	value, err := signer.Sign(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(value) > 100 {
+		t.Fatalf("custom ID has %d characters", len(value))
+	}
+	got, err := signer.Verify(value, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("got %#v, want %#v", got, want)
+	}
+}

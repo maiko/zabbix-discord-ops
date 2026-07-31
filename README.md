@@ -3,9 +3,11 @@
 Zabbix Discord Ops adds tenant-aware, interactive incident operations to
 Discord without making Discord a source of truth.
 
-It sends Zabbix problems to the correct Discord channel and lets authorized
+It sends Zabbix problems and maintenance state to the correct Discord channel and lets authorized
 operators acknowledge, comment on, suppress, change severity, unsuppress, or
-manually close a problem. Every interaction re-reads the live Zabbix problem
+manually close a problem. Authorized operators can also inspect hosts and
+problems, schedule or extend downtime, end active maintenance, and cancel
+future maintenance. Every mutation re-reads the live Zabbix object
 and revalidates the Discord guild, channel, user or role, Zabbix event tags,
 and Zabbix host group before changing anything.
 
@@ -32,8 +34,8 @@ possibly completed action. Graceful shutdown drains in-flight interactions.
 The service has no database, accepts no Discord message content, does not need
 privileged intents, and stores no credentials in its JSON configuration. It
 does persist event, route, channel, message, and pending-at metadata in a small
-directory of atomic JSON records so notification correlation survives process
-restarts without a database.
+directory of atomic JSON records so notification correlation, maintenance
+cards, and single-use maintenance intents survive process restarts.
 Replay entries live in process memory until Discord's five-minute signature
 window closes. A process restart clears that cache, so repeated Zabbix comments
 can still be submitted if Discord replays the exact interaction across a
@@ -48,8 +50,22 @@ an interaction after a bot restart.
   severity, and manually close.
 - Slash commands:
   - `/zabbix status`
-  - `/zabbix problems`
+  - `/zabbix whoami`
+  - `/zabbix host host:<host>`
+  - `/zabbix problem event:<event>`
+  - `/zabbix problems [host] [severity]`
+  - `/zabbix downtime start host:<host> duration:<Nm|Nh|Nd> [starts_in] [reason]`
+  - `/zabbix downtime list [host] [state]`
+  - `/zabbix downtime extend maintenance:<id> duration:<Nm|Nh|Nd> [reason]`
+  - `/zabbix downtime end maintenance:<id> [reason]`
+  - `/zabbix downtime cancel maintenance:<id> [reason]`
 - Prometheus text metrics on the loopback `/metrics` endpoint.
+
+Durations are strict single-unit values from 5 minutes through 7 days.
+Autocomplete results are derived only from the caller's currently authorized
+route set and use a route-partitioned 15-second cache; selecting a suggestion
+does not bypass live mutation authorization. Slash command responses are
+private; mirror channels remain read-only.
 
 Manual close still depends on the underlying Zabbix trigger allowing manual
 close. Zabbix rejects the action if the trigger policy forbids it.
@@ -63,6 +79,11 @@ Each route is fail-closed and binds all of the following:
 - at least one permitted Discord role or user;
 - required Zabbix event tags;
 - at least one permitted Zabbix host group ID.
+
+Maintenance-enabled routes additionally require exact host tags. An optional
+host ID allowlist can limit a rollout to canaries without weakening route
+authorization. Cancelling a future maintenance object requires an explicit
+Discord user ID; role membership alone never authorizes deletion.
 
 The event must also contain the configured routing tag. A typical route uses
 `notification_route=customer_prod`, `tenant=customer`, and `impact=prod`,
@@ -173,6 +194,15 @@ all service access. A new route must not ship until its exact host group has
 been added to both the bot configuration and this dedicated user group's
 rights.
 
+Maintenance uses a second API identity and token. Zabbix requires an Admin
+role for maintenance mutations, but its API allowlist remains limited to
+`host.get` and `maintenance.get/create/update/delete`. Enable only the
+`edit_maintenance` role action and `monitoring.hosts` UI element.
+Keep frontend access disabled and grant read-write rights only to the exact
+host groups used by enabled routes. Every maintenance read uses
+`editable=true`; the bot expands the affected hosts and requires every host
+to match exactly one authorized route before a mutation.
+
 ### Media type
 
 Import
@@ -210,7 +240,7 @@ Do not delete the correlation state while alerts are active. If it is lost,
 only Discord's short nonce uniqueness window remains and a sufficiently
 delayed retry can create a duplicate.
 `state_review_after_days` (90 by default, configurable from 30 to 3650 days)
-defines when a completed record is considered stale. Startup and daily
+defines when a completed record is considered stale. Startup and periodic
 inspections validate every record, log the stale count, and publish it as
 `zabbix_discord_ops_stale_completed_correlations`; they never delete state.
 Pending and completed records remain available until an operator reviews exact
@@ -267,6 +297,7 @@ Provision these systemd credential names:
 - `discord-bot-token`
 - `discord-public-key`
 - `zabbix-api-token`
+- `zabbix-maintenance-api-token`
 - `ingest-token`
 - `component-signing-key`
 

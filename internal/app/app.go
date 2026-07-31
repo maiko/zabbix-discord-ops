@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,18 +23,22 @@ import (
 	"github.com/maiko/zabbix-discord-ops/internal/config"
 	"github.com/maiko/zabbix-discord-ops/internal/correlation"
 	"github.com/maiko/zabbix-discord-ops/internal/discord"
+	"github.com/maiko/zabbix-discord-ops/internal/maintenancecard"
+	"github.com/maiko/zabbix-discord-ops/internal/operation"
 	"github.com/maiko/zabbix-discord-ops/internal/zabbix"
 )
 
 const (
-	interactionPing      = 1
-	interactionCommand   = 2
-	interactionComponent = 3
-	interactionModal     = 5
+	interactionPing         = 1
+	interactionCommand      = 2
+	interactionComponent    = 3
+	interactionAutocomplete = 4
+	interactionModal        = 5
 
 	responsePong            = 1
 	responseMessage         = 4
 	responseDeferredMessage = 5
+	responseAutocomplete    = 8
 	responseModal           = 9
 	ephemeralFlag           = 64
 )
@@ -59,30 +64,62 @@ type zabbixClient interface {
 	Acknowledge(context.Context, string, int, string, map[string]any) error
 }
 
+type maintenanceClient interface {
+	Hosts(context.Context, []string) ([]zabbix.Host, error)
+	HostsByMaintenance(context.Context, []string) ([]zabbix.Host, error)
+	HostsByGroups(context.Context, []string) ([]zabbix.Host, error)
+	Maintenances(context.Context, []string) ([]zabbix.Maintenance, error)
+	CreateMaintenance(context.Context, map[string]any) (string, error)
+	UpdateMaintenance(context.Context, map[string]any) error
+	DeleteMaintenance(context.Context, string) error
+}
+
 type metrics struct {
-	interactions               atomic.Uint64
-	rejected                   atomic.Uint64
-	ingested                   atomic.Uint64
-	actions                    atomic.Uint64
-	errors                     atomic.Uint64
-	staleCompletedCorrelations atomic.Uint64
+	interactions                    atomic.Uint64
+	rejected                        atomic.Uint64
+	ingested                        atomic.Uint64
+	actions                         atomic.Uint64
+	errors                          atomic.Uint64
+	staleCompletedCorrelations      atomic.Uint64
+	maintenanceLastSync             atomic.Int64
+	maintenancePending              atomic.Uint64
+	maintenancePendingAge           atomic.Int64
+	maintenanceMutationUnknown      atomic.Uint64
+	maintenanceAuthRejected         atomic.Uint64
+	maintenancePrimaryPublishErrors atomic.Uint64
+	maintenanceMirrorPublishErrors  atomic.Uint64
+	maintenanceSyncDegraded         atomic.Uint64
+	maintenanceScheduled            atomic.Uint64
+	maintenanceActivating           atomic.Uint64
+	maintenanceActive               atomic.Uint64
+	maintenanceEnding               atomic.Uint64
+	maintenanceEnded                atomic.Uint64
+	maintenanceExpired              atomic.Uint64
+	maintenanceCancelled            atomic.Uint64
 }
 
 type App struct {
-	cfg               config.Config
-	ingestToken       string
-	verifier          *discord.Verifier
-	signer            *discord.Signer
-	discord           discordClient
-	zabbix            zabbixClient
-	logger            *slog.Logger
-	now               func() time.Time
-	correlations      *correlation.Store
-	correlationLocks  *keyedLocker
-	ingestTimeout     time.Duration
-	successMessageTTL time.Duration
-	deferredJobs      sync.WaitGroup
-	metrics           metrics
+	cfg                config.Config
+	ingestToken        string
+	verifier           *discord.Verifier
+	signer             *discord.Signer
+	discord            discordClient
+	zabbix             zabbixClient
+	maintenance        maintenanceClient
+	logger             *slog.Logger
+	now                func() time.Time
+	correlations       *correlation.Store
+	correlationLocks   *keyedLocker
+	maintenanceOps     *operation.Store
+	maintenanceCards   *maintenancecard.Store
+	maintenanceLocks   *keyedLocker
+	maintenanceCacheMu sync.Mutex
+	maintenanceCache   map[string]maintenanceCacheEntry
+	maintenanceCardsMu sync.Mutex
+	ingestTimeout      time.Duration
+	successMessageTTL  time.Duration
+	deferredJobs       sync.WaitGroup
+	metrics            metrics
 }
 
 type IngestEvent struct {
@@ -121,6 +158,14 @@ func New(
 	if err != nil {
 		return nil, fmt.Errorf("load correlation state: %w", err)
 	}
+	maintenanceOps, err := operation.New(filepath.Join(cfg.StatePath, "maintenance-operations"))
+	if err != nil {
+		return nil, fmt.Errorf("load maintenance operation state: %w", err)
+	}
+	maintenanceCards, err := maintenancecard.New(filepath.Join(cfg.StatePath, "maintenance-cards"))
+	if err != nil {
+		return nil, fmt.Errorf("load maintenance card state: %w", err)
+	}
 	application := &App{
 		cfg:         cfg,
 		ingestToken: secrets.IngestToken,
@@ -132,10 +177,15 @@ func New(
 			cfg.DiscordBotUserID,
 		),
 		zabbix:            zabbix.NewClient(cfg.ZabbixURL, secrets.ZabbixAPIToken),
+		maintenance:       zabbix.NewClient(cfg.ZabbixURL, secrets.ZabbixMaintenanceAPIToken),
 		logger:            logger,
 		now:               time.Now,
 		correlations:      correlations,
 		correlationLocks:  newKeyedLocker(),
+		maintenanceOps:    maintenanceOps,
+		maintenanceCards:  maintenanceCards,
+		maintenanceLocks:  newKeyedLocker(),
+		maintenanceCache:  make(map[string]maintenanceCacheEntry),
 		ingestTimeout:     8 * time.Second,
 		successMessageTTL: 3 * time.Second,
 	}
@@ -166,8 +216,9 @@ func (a *App) ValidateDiscordIdentity(ctx context.Context) error {
 }
 
 func (a *App) RunMaintenance(ctx context.Context) {
-	ticker := time.NewTicker(24 * time.Hour)
+	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
+	a.reconcileMaintenanceState(ctx, a.now())
 	for {
 		select {
 		case <-ctx.Done():
@@ -177,6 +228,7 @@ func (a *App) RunMaintenance(ctx context.Context) {
 				a.metrics.errors.Add(1)
 				a.logger.Error("inspect completed Discord correlations", "error", err)
 			}
+			a.reconcileMaintenanceState(ctx, now)
 		}
 	}
 }
@@ -256,6 +308,8 @@ func (a *App) handleInteraction(response http.ResponseWriter, request *http.Requ
 		payload = map[string]any{"type": responsePong}
 	case interactionCommand:
 		payload, err = a.command(operationContext, interaction)
+	case interactionAutocomplete:
+		payload, err = a.autocomplete(operationContext, interaction)
 	case interactionComponent:
 		payload, err = a.component(operationContext, interaction)
 	case interactionModal:
@@ -271,12 +325,19 @@ func (a *App) handleInteraction(response http.ResponseWriter, request *http.Requ
 			"user_id", interaction.Member.User.ID,
 			"error", err,
 		)
-		payload = ephemeral("Action rejected. The event or tenant authorization no longer matches.")
+		if interaction.Type == interactionAutocomplete {
+			payload = autocompleteResponse(nil)
+		} else {
+			payload = ephemeral("Action rejected. The event or tenant authorization no longer matches.")
+		}
 	}
 	writeJSON(response, http.StatusOK, payload)
 }
 
 func (a *App) requiresDeferredResponse(interaction discord.Interaction) bool {
+	if interaction.Type == interactionCommand {
+		return true
+	}
 	if interaction.Type == interactionModal {
 		return true
 	}
@@ -288,7 +349,7 @@ func (a *App) requiresDeferredResponse(interaction discord.Interaction) bool {
 		return false
 	}
 	switch component.Action {
-	case "ack", "unsuppress", "close-confirm":
+	case "ack", "unsuppress", "close-confirm", "maintenance-cancel-confirm":
 		return true
 	default:
 		return false
@@ -299,8 +360,13 @@ func (a *App) completeDeferredInteraction(interaction discord.Interaction) {
 	operationContext, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 
-	var err error
+	var (
+		err     error
+		payload any
+	)
 	switch interaction.Type {
+	case interactionCommand:
+		payload, err = a.command(operationContext, interaction)
 	case interactionComponent:
 		_, err = a.component(operationContext, interaction)
 	case interactionModal:
@@ -329,13 +395,21 @@ func (a *App) completeDeferredInteraction(interaction discord.Interaction) {
 		)
 		content = "Action rejected. The event or tenant authorization no longer matches."
 	}
+	var editPayload any = interactionMessage(content)
+	if err == nil && interaction.Type == interactionCommand {
+		if commandPayload, ok := payload.(map[string]any); ok {
+			if data, dataOK := commandPayload["data"]; dataOK {
+				editPayload = data
+			}
+		}
+	}
 	editContext, editCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer editCancel()
 	editErr := a.discord.EditOriginalInteraction(
 		editContext,
 		interaction.ApplicationID,
 		interaction.Token,
-		interactionMessage(content),
+		editPayload,
 	)
 	if editErr != nil {
 		a.metrics.errors.Add(1)
@@ -346,6 +420,9 @@ func (a *App) completeDeferredInteraction(interaction discord.Interaction) {
 		return
 	}
 	if err != nil {
+		return
+	}
+	if interaction.Type == interactionCommand {
 		return
 	}
 
@@ -383,76 +460,16 @@ func (a *App) WaitForDeferred(ctx context.Context) error {
 }
 
 func (a *App) command(ctx context.Context, interaction discord.Interaction) (any, error) {
-	if interaction.Data.Name != "zabbix" || len(interaction.Data.Options) != 1 {
-		return nil, errors.New("unsupported command")
-	}
-	routes := a.authorizedRoutes(interaction)
-	if len(routes) == 0 {
-		return nil, errors.New("no authorized route")
-	}
-	switch interaction.Data.Options[0].Name {
-	case "status":
-		version, err := a.zabbix.Version(ctx)
-		if err != nil {
-			return nil, err
-		}
-		problems, err := a.zabbix.Problems(ctx, 100)
-		if err != nil {
-			return nil, err
-		}
-		count := 0
-		for routeName, route := range routes {
-			for _, problem := range problems {
-				matches, err := a.problemMatchesRoute(problem, routeName, route)
-				if err != nil {
-					return nil, err
-				}
-				if matches {
-					count++
-				}
-			}
-		}
-		return ephemeral(fmt.Sprintf("Zabbix %s is reachable. %d routed problem(s) open.", version, count)), nil
-	case "problems":
-		problems, err := a.zabbix.Problems(ctx, 100)
-		if err != nil {
-			return nil, err
-		}
-		lines := make([]string, 0, 10)
-		for _, problem := range problems {
-			for routeName, route := range routes {
-				matches, err := a.problemMatchesRoute(problem, routeName, route)
-				if err != nil {
-					return nil, err
-				}
-				if !matches {
-					continue
-				}
-				lines = append(lines, fmt.Sprintf(
-					"`%s` %s — %s",
-					problem.EventID,
-					severityName(problem.SeverityInt()),
-					truncate(problem.Name, 160),
-				))
-				break
-			}
-			if len(lines) == 10 {
-				break
-			}
-		}
-		if len(lines) == 0 {
-			lines = append(lines, "No routed open problems.")
-		}
-		return ephemeral(strings.Join(lines, "\n")), nil
-	default:
-		return nil, errors.New("unsupported subcommand")
-	}
+	return a.commandV3(ctx, interaction)
 }
 
 func (a *App) component(ctx context.Context, interaction discord.Interaction) (any, error) {
 	component, err := a.signer.Verify(interaction.Data.CustomID, a.now())
 	if err != nil {
 		return nil, err
+	}
+	if component.Action == "maintenance-cancel-confirm" {
+		return a.confirmCancelDowntime(ctx, interaction, component)
 	}
 	route, problem, err := a.authorizeEvent(ctx, interaction, component)
 	if err != nil {
@@ -1146,13 +1163,61 @@ func (a *App) handleMetrics(response http.ResponseWriter, _ *http.Request) {
 			"zabbix_discord_ops_errors_total %d\n"+
 			"# HELP zabbix_discord_ops_stale_completed_correlations Completed correlation records awaiting operator review.\n"+
 			"# TYPE zabbix_discord_ops_stale_completed_correlations gauge\n"+
-			"zabbix_discord_ops_stale_completed_correlations %d\n",
+			"zabbix_discord_ops_stale_completed_correlations %d\n"+
+			"# HELP zabbix_discord_ops_maintenance_last_sync_timestamp_seconds Last successful maintenance synchronization.\n"+
+			"# TYPE zabbix_discord_ops_maintenance_last_sync_timestamp_seconds gauge\n"+
+			"zabbix_discord_ops_maintenance_last_sync_timestamp_seconds %d\n"+
+			"# HELP zabbix_discord_ops_maintenance_pending_operations Pending maintenance operations.\n"+
+			"# TYPE zabbix_discord_ops_maintenance_pending_operations gauge\n"+
+			"zabbix_discord_ops_maintenance_pending_operations %d\n"+
+			"# HELP zabbix_discord_ops_maintenance_oldest_pending_seconds Age of the oldest pending maintenance operation.\n"+
+			"# TYPE zabbix_discord_ops_maintenance_oldest_pending_seconds gauge\n"+
+			"zabbix_discord_ops_maintenance_oldest_pending_seconds %d\n"+
+			"# HELP zabbix_discord_ops_maintenance_mutation_unknown_total Maintenance mutations with unknown outcome.\n"+
+			"# TYPE zabbix_discord_ops_maintenance_mutation_unknown_total counter\n"+
+			"zabbix_discord_ops_maintenance_mutation_unknown_total %d\n"+
+			"# HELP zabbix_discord_ops_maintenance_auth_rejected_total Maintenance authorization rejections.\n"+
+			"# TYPE zabbix_discord_ops_maintenance_auth_rejected_total counter\n"+
+			"zabbix_discord_ops_maintenance_auth_rejected_total %d\n"+
+			"# HELP zabbix_discord_ops_maintenance_primary_publish_errors_total Primary maintenance card publish errors.\n"+
+			"# TYPE zabbix_discord_ops_maintenance_primary_publish_errors_total counter\n"+
+			"zabbix_discord_ops_maintenance_primary_publish_errors_total %d\n"+
+			"# HELP zabbix_discord_ops_maintenance_mirror_publish_errors_total Mirror maintenance card publish errors.\n"+
+			"# TYPE zabbix_discord_ops_maintenance_mirror_publish_errors_total counter\n"+
+			"zabbix_discord_ops_maintenance_mirror_publish_errors_total %d\n"+
+			"# HELP zabbix_discord_ops_maintenance_sync_degraded Maintenance synchronization is degraded.\n"+
+			"# TYPE zabbix_discord_ops_maintenance_sync_degraded gauge\n"+
+			"zabbix_discord_ops_maintenance_sync_degraded %d\n"+
+			"# HELP zabbix_discord_ops_maintenance_state Maintenance cards by lifecycle state.\n"+
+			"# TYPE zabbix_discord_ops_maintenance_state gauge\n"+
+			"zabbix_discord_ops_maintenance_state{state=\"scheduled\"} %d\n"+
+			"zabbix_discord_ops_maintenance_state{state=\"activating\"} %d\n"+
+			"zabbix_discord_ops_maintenance_state{state=\"active\"} %d\n"+
+			"zabbix_discord_ops_maintenance_state{state=\"ending\"} %d\n"+
+			"zabbix_discord_ops_maintenance_state{state=\"ended\"} %d\n"+
+			"zabbix_discord_ops_maintenance_state{state=\"expired\"} %d\n"+
+			"zabbix_discord_ops_maintenance_state{state=\"cancelled\"} %d\n",
 		a.metrics.interactions.Load(),
 		a.metrics.rejected.Load(),
 		a.metrics.ingested.Load(),
 		a.metrics.actions.Load(),
 		a.metrics.errors.Load(),
 		a.metrics.staleCompletedCorrelations.Load(),
+		a.metrics.maintenanceLastSync.Load(),
+		a.metrics.maintenancePending.Load(),
+		a.metrics.maintenancePendingAge.Load(),
+		a.metrics.maintenanceMutationUnknown.Load(),
+		a.metrics.maintenanceAuthRejected.Load(),
+		a.metrics.maintenancePrimaryPublishErrors.Load(),
+		a.metrics.maintenanceMirrorPublishErrors.Load(),
+		a.metrics.maintenanceSyncDegraded.Load(),
+		a.metrics.maintenanceScheduled.Load(),
+		a.metrics.maintenanceActivating.Load(),
+		a.metrics.maintenanceActive.Load(),
+		a.metrics.maintenanceEnding.Load(),
+		a.metrics.maintenanceEnded.Load(),
+		a.metrics.maintenanceExpired.Load(),
+		a.metrics.maintenanceCancelled.Load(),
 	)
 }
 

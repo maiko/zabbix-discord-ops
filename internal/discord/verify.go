@@ -72,10 +72,11 @@ func (v *Verifier) Verify(timestamp, signatureHex string, body []byte, now time.
 }
 
 type ComponentToken struct {
-	Action  string `json:"a"`
-	EventID string `json:"e"`
-	Route   string `json:"r"`
-	Expires int64  `json:"x"`
+	Action        string `json:"a"`
+	EventID       string `json:"e"`
+	Route         string `json:"r"`
+	SubjectUserID string `json:"u,omitempty"`
+	Expires       int64  `json:"x"`
 }
 
 type Signer struct {
@@ -83,16 +84,17 @@ type Signer struct {
 }
 
 var componentActionCodes = map[string]string{
-	"ack":             "a",
-	"unsuppress":      "u",
-	"comment":         "c",
-	"comment-submit":  "C",
-	"suppress":        "s",
-	"suppress-submit": "S",
-	"severity":        "v",
-	"severity-submit": "V",
-	"close":           "x",
-	"close-confirm":   "X",
+	"ack":                        "a",
+	"unsuppress":                 "u",
+	"comment":                    "c",
+	"comment-submit":             "C",
+	"suppress":                   "s",
+	"suppress-submit":            "S",
+	"severity":                   "v",
+	"severity-submit":            "V",
+	"close":                      "x",
+	"close-confirm":              "X",
+	"maintenance-cancel-confirm": "M",
 }
 
 func NewSigner(key []byte) (*Signer, error) {
@@ -107,6 +109,25 @@ func (s *Signer) Sign(component ComponentToken) (string, error) {
 	if !ok || !isDecimal(component.EventID) || !isRouteName(component.Route) || component.Expires <= 0 {
 		return "", errors.New("invalid component payload")
 	}
+	if component.Action == "maintenance-cancel-confirm" {
+		if !isDecimal(component.SubjectUserID) {
+			return "", errors.New("maintenance component requires a Discord user")
+		}
+		eventID, eventErr := strconv.ParseUint(component.EventID, 10, 64)
+		userID, userErr := strconv.ParseUint(component.SubjectUserID, 10, 64)
+		if eventErr != nil || userErr != nil {
+			return "", errors.New("maintenance component has an invalid numeric ID")
+		}
+		payload := strings.Join([]string{
+			"2",
+			actionCode,
+			strconv.FormatUint(eventID, 36),
+			component.Route,
+			strconv.FormatUint(userID, 36),
+			strconv.FormatInt(component.Expires, 36),
+		}, ".")
+		return s.signedValue(payload)
+	}
 	payload := strings.Join([]string{
 		"1",
 		actionCode,
@@ -114,6 +135,10 @@ func (s *Signer) Sign(component ComponentToken) (string, error) {
 		component.Route,
 		strconv.FormatInt(component.Expires, 36),
 	}, ".")
+	return s.signedValue(payload)
+}
+
+func (s *Signer) signedValue(payload string) (string, error) {
 	mac := hmac.New(sha256.New, s.key)
 	_, _ = mac.Write([]byte(payload))
 	signature := base64.RawURLEncoding.EncodeToString(mac.Sum(nil)[:16])
@@ -127,6 +152,9 @@ func (s *Signer) Sign(component ComponentToken) (string, error) {
 func (s *Signer) Verify(value string, now time.Time) (ComponentToken, error) {
 	var component ComponentToken
 	parts := strings.Split(value, ".")
+	if len(parts) == 7 && parts[0] == "2" {
+		return s.verifyMaintenance(parts, now)
+	}
 	if len(parts) != 6 || parts[0] != "1" {
 		return component, errors.New("malformed component ID")
 	}
@@ -154,6 +182,43 @@ func (s *Signer) Verify(value string, now time.Time) (ComponentToken, error) {
 		EventID: parts[2],
 		Route:   parts[3],
 		Expires: expires,
+	}
+	if now.Unix() > component.Expires {
+		return component, fmt.Errorf("component expired at %d", component.Expires)
+	}
+	return component, nil
+}
+
+func (s *Signer) verifyMaintenance(
+	parts []string,
+	now time.Time,
+) (ComponentToken, error) {
+	var component ComponentToken
+	payload := strings.Join(parts[:6], ".")
+	mac := hmac.New(sha256.New, s.key)
+	_, _ = mac.Write([]byte(payload))
+	expected := mac.Sum(nil)[:16]
+	actual, err := base64.RawURLEncoding.DecodeString(parts[6])
+	if err != nil || !hmac.Equal(expected, actual) {
+		return component, errors.New("invalid component signature")
+	}
+	if parts[1] != componentActionCodes["maintenance-cancel-confirm"] ||
+		!isRouteName(parts[3]) {
+		return component, errors.New("invalid maintenance component payload")
+	}
+	eventID, eventErr := strconv.ParseUint(parts[2], 36, 64)
+	userID, userErr := strconv.ParseUint(parts[4], 36, 64)
+	expires, expiresErr := strconv.ParseInt(parts[5], 36, 64)
+	if eventErr != nil || userErr != nil || expiresErr != nil ||
+		eventID == 0 || userID == 0 {
+		return component, errors.New("invalid maintenance component payload")
+	}
+	component = ComponentToken{
+		Action:        "maintenance-cancel-confirm",
+		EventID:       strconv.FormatUint(eventID, 10),
+		Route:         parts[3],
+		SubjectUserID: strconv.FormatUint(userID, 10),
+		Expires:       expires,
 	}
 	if now.Unix() > component.Expires {
 		return component, fmt.Errorf("component expired at %d", component.Expires)
